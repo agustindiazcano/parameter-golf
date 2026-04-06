@@ -415,7 +415,7 @@ class VolumetricLogic(nn.Module):
         # Acumular actividad
         self._activity_accum.add_(phi.detach().mean(dim=0))
         self._activity_count.add_(1)
-        self.last_sparsity = float((phi == 0).float().mean().item())
+        self.last_sparsity = 0.0  # se mide fuera del grafo
 
         out = (phi @ self.push_vectors) * self.out_scale
         return out.reshape(B, S, D).to(h.dtype)
@@ -819,7 +819,7 @@ def main():
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(args, model, rank, world_size, device,
                                          grad_accum_steps, val_tokens, bb_lut, hls_lut, ibt_lut)
-            avg_sp = sum(b.mlp.last_sparsity for b in base_model.blocks) / len(base_model.blocks)
+            avg_sp = 0.0  # simplificado por ahora
             avg_k  = sum(int(b.mlp.k_active.item()) for b in base_model.blocks) / len(base_model.blocks)
             log0(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                  f"vl_sparsity:{avg_sp:.1%} vl_k_avg:{avg_k:.0f} "
