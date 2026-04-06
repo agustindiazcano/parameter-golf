@@ -615,28 +615,23 @@ class VolumetricLogic(nn.Module):
 
     def forward(self, h: Tensor) -> Tensor:
         B, S, D = h.shape
-        k = int(self.k_active.item())
 
         h_f    = h.reshape(B * S, D)
         h_norm = F.normalize(h_f, p=2, dim=-1)
 
-        # Operar solo sobre esferas activas [:k]
-        c_norm = F.normalize(self.centers[:k], p=2, dim=-1)
-        radii  = F.softplus(self.log_radii[:k]) + 0.01
+        # Grafo 100% estatico: siempre K_MAX esferas.
+        # Slots inactivos tienen push_vectors=0 -> contribucion nula.
+        c_norm = F.normalize(self.centers, p=2, dim=-1)
+        radii  = F.softplus(self.log_radii) + 0.01
 
-        # Distancia coseno + activación RBF
-        dist = 1.0 - (h_norm @ c_norm.T)          # (N, k)
-        phi  = torch.relu(1.0 - dist / radii)      # (N, k) — sparse
+        dist = 1.0 - (h_norm @ c_norm.T)
+        phi  = torch.relu(1.0 - dist / radii.unsqueeze(0))
 
-        # Acumular actividad para poda (sin gradiente)
-        with torch.no_grad():
-            batch_act = phi.mean(dim=0).detach()
-            self._activity_accum[:k].add_(batch_act)
-            self._activity_count.add_(1)
-            self.last_sparsity = float((phi == 0).float().mean().item())
+        # Acumular actividad (fuera del grafo compilado via detach)
+        self._activity_accum.add_(phi.detach().mean(dim=0))
+        self._activity_count.add_(1)
 
-        # Proyección sparse → espacio de activación
-        out = (phi @ self.push_vectors[:k]).reshape(B, S, D)
+        out = (phi @ self.push_vectors).reshape(B, S, D)
         return out * self.out_scale.to(dtype=out.dtype)
 
     # ------------------------------------------------------------------
