@@ -627,6 +627,7 @@ class VolumetricLogic(nn.Module):
 
     def _init_weights(self, k_init: int, init_radius: float) -> None:
         with torch.no_grad():
+            # Después: placeholder, se inicializa en el training loop
             c = F.normalize(torch.randn(k_init, self.dim), p=2, dim=-1)
             self.centers[:k_init].copy_(c)
             init_r = math.log(math.exp(init_radius) - 1.0)
@@ -931,6 +932,16 @@ def main():
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    # Inicializar centros VL con embeddings reales
+    with torch.no_grad():
+        x_init, _ = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+        emb = base_model.tok_emb(x_init.to(device)[:, :64].reshape(-1))
+        emb_norm = F.normalize(emb, p=2, dim=-1)
+        for block in base_model.blocks:
+            k = int(block.mlp.k_active.item())
+            idx = torch.randint(0, emb_norm.shape[0], (k,))
+            block.mlp.centers.data[:k] = emb_norm[idx]
 
     # Warmup
     if args.warmup_steps > 0:
