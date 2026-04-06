@@ -409,8 +409,8 @@ class VolumetricLogic(nn.Module):
 
         # Distancia coseno + RBF
         h_norm = F.normalize(h_f, p=2, dim=-1)
-        dist   = 1.0 - (h_norm @ c_norm.T)
-        phi    = torch.relu(1.0 - dist / radii.unsqueeze(0))
+        cosine_dist = 1.0 - (h_norm @ c_norm.T)
+        phi         = torch.relu(1.0 - cosine_dist / radii.unsqueeze(0))
 
         # Acumular actividad
         self._activity_accum.add_(phi.detach().mean(dim=0))
@@ -832,8 +832,8 @@ def main():
                 vl     = base_model.blocks[0].mlp
                 c_norm = F.normalize(vl.centers, p=2, dim=-1)
                 radii  = F.softplus(vl.log_radii) + 0.01
-                dist   = 1.0 - (h_norm @ c_norm.T)
-                phi    = torch.relu(1.0 - dist / radii.unsqueeze(0))
+                cosine_dist = 1.0 - (h_norm @ c_norm.T)
+                phi         = torch.relu(1.0 - cosine_dist / radii.unsqueeze(0))
                 avg_sp = float((phi == 0).float().mean().item())
                 base_model.train()
             avg_k  = sum(int(b.mlp.k_active.item()) for b in base_model.blocks) / len(base_model.blocks)
