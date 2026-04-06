@@ -606,7 +606,7 @@ class VolumetricLogic(nn.Module):
             self.centers[:k_init].copy_(c)
 
             # Radio inicial: softplus⁻¹(0.5)
-            init_r = math.log(math.exp(0.5) - 1.0)
+            init_r = math.log(math.exp(2.0) - 1.0)  # radio inicial grande: cubre espacio completo
             self.log_radii[:k_init].fill_(init_r)
 
             # Push vectors: inicialización tipo Kaiming
