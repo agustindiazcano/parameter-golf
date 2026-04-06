@@ -88,7 +88,7 @@ class Hyperparameters:
     vl_evo_interval    = int(os.environ.get("VL_EVO_INTERVAL",    500))
     vl_evo_cutoff_frac = float(os.environ.get("VL_EVO_CUTOFF_FRAC", 0.40))
     vl_prune_threshold = float(os.environ.get("VL_PRUNE_THRESHOLD", 0.001))
-    vl_lr_mult         = float(os.environ.get("VL_LR_MULT",        4.0))
+    vl_lr_mult         = float(os.environ.get("VL_LR_MULT",        "1.0"))
     vl_grad_clip       = float(os.environ.get("VL_GRAD_CLIP",      0.5))
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
