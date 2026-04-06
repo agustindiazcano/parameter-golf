@@ -407,12 +407,7 @@ def dequantize_state_dict_int8(obj):
 if HAS_TRITON:
     @triton.jit
     def flash_vl_fwd_kernel(
-        h_ptr,        # (M, D) tokens en bfloat16
-        c_ptr,        # (K, D) centros normalizados float32
-        r_ptr,        # (K,)   radios softplus float32
-        p_ptr,        # (K, D) push vectors bfloat16
-        out_ptr,      # (M, D) output float32
-        act_ptr,      # (K,)   activity accumulator float32
+        h_ptr, c_ptr, r_ptr, p_ptr, out_ptr, act_ptr,
         M, K, D,
         stride_hm, stride_hd,
         stride_ck, stride_cd,
@@ -424,56 +419,53 @@ if HAS_TRITON:
     ):
         pid = tl.program_id(0)
         offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, BLOCK_D)
         mask_m = offs_m < M
 
-        # Cargar bloque de tokens h → SRAM (una sola vez)
-        h = tl.load(h_ptr + offs_m[:, None] * stride_hm + offs_d[None, :] * stride_hd,
-                    mask=mask_m[:, None], other=0.0).to(tl.float32)
+        # Paso 1: calcular norma L2 de h acumulando sobre bloques de D
+        h_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for d0 in range(0, D, BLOCK_D):
+            offs_d = d0 + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            h_c = tl.load(h_ptr + offs_m[:, None] * stride_hm + offs_d[None, :] * stride_hd,
+                          mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            h_sq += tl.sum(h_c * h_c, axis=1)
+        h_inv_norm = 1.0 / tl.sqrt(h_sq + 1e-8)
 
-        # Normalizar h en registros (L2)
-        h_sq = tl.sum(h * h, axis=1)
-        h_norm_scale = 1.0 / tl.sqrt(h_sq + 1e-8)
-        h = h * h_norm_scale[:, None]
-
-        # Acumulador de salida en registros
-        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-
-        # Iterar sobre esferas en bloques BLOCK_K
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
+        # Paso 2: iterar sobre bloques de esferas
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
             mask_k = offs_k < K
 
-            # Cargar centros (ya normalizados)
-            c = tl.load(c_ptr + offs_k[:, None] * stride_ck + offs_d[None, :] * stride_cd,
-                        mask=mask_k[:, None], other=0.0).to(tl.float32)
+            # Calcular dot(h_norm, c_norm.T) acumulando sobre D
+            dot = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+            for d0 in range(0, D, BLOCK_D):
+                offs_d = d0 + tl.arange(0, BLOCK_D)
+                mask_d = offs_d < D
+                h_c = tl.load(h_ptr + offs_m[:, None] * stride_hm + offs_d[None, :] * stride_hd,
+                              mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+                h_c = h_c * h_inv_norm[:, None]
+                c_c = tl.load(c_ptr + offs_k[:, None] * stride_ck + offs_d[None, :] * stride_cd,
+                              mask=mask_k[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+                dot += tl.dot(h_c, tl.trans(c_c))
 
-            # Distancia coseno: dot = h @ c.T → (BLOCK_M, BLOCK_K)
-            dot = tl.dot(h, tl.trans(c))
-            dist = 1.0 - dot
-
-            # Radio
+            # Calcular phi
             r = tl.load(r_ptr + offs_k, mask=mask_k, other=1.0)
+            phi = tl.maximum(0.0, 1.0 - (1.0 - dot) / r[None, :])
 
-            # phi = relu(1 - dist/r)
-            phi = tl.maximum(0.0, 1.0 - dist / r[None, :])
+            # Early exit si ninguna esfera activa
+            if tl.max(phi) > 0.0:
+                # Atomic add activity (fusionado, sin pasada extra)
+                tl.atomic_add(act_ptr + offs_k, tl.sum(phi, axis=0), mask=mask_k)
 
-            # Early exit: si max(phi) == 0 en este bloque, ningún token activó
-            # ninguna esfera → saltear push_vectors completamente
-            phi_max = tl.max(phi)
-            if phi_max > 0.0:
-                # Acumular activity via atomic_add (fusionado, sin pasada extra)
-                phi_sum = tl.sum(phi, axis=0)
-                tl.atomic_add(act_ptr + offs_k, phi_sum, mask=mask_k)
-
-                # Cargar push_vectors y acumular influencia
-                pv = tl.load(p_ptr + offs_k[:, None] * stride_pk + offs_d[None, :] * stride_pd,
-                             mask=mask_k[:, None], other=0.0).to(tl.float32)
-                acc += tl.dot(phi.to(tl.bfloat16), pv.to(tl.bfloat16)).to(tl.float32)
-
-        # Escribir output a VRAM (una sola vez)
-        tl.store(out_ptr + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
-                 acc, mask=mask_m[:, None])
+                # Acumular phi @ push_vectors en out via atomic_add sobre D
+                for d0 in range(0, D, BLOCK_D):
+                    offs_d = d0 + tl.arange(0, BLOCK_D)
+                    mask_d = offs_d < D
+                    pv = tl.load(p_ptr + offs_k[:, None] * stride_pk + offs_d[None, :] * stride_pd,
+                                 mask=mask_k[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+                    contrib = tl.dot(phi.to(tl.bfloat16), pv.to(tl.bfloat16)).to(tl.float32)
+                    tl.atomic_add(out_ptr + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
+                                  contrib, mask=mask_m[:, None] & mask_d[None, :])
 
 
     def flash_vl_forward(h: Tensor, centers: Tensor, radii: Tensor,
@@ -500,10 +492,11 @@ if HAS_TRITON:
 
         out = torch.zeros(M, D, device=dev, dtype=torch.float32)
 
-        # BLOCK_D debe ser potencia de 2 y <= D
-        BLOCK_D = min(triton.next_power_of_2(D), D)
-        BLOCK_M = 128
-        BLOCK_K = 64
+        # BLOCK_D <= 64 para no exceder SRAM del SM (232KB limite H100/A100)
+        # D=512: procesamos en 8 bloques de 64. D=256: 4 bloques de 64.
+        BLOCK_D = 64
+        BLOCK_M = 64   # reducido para controlar presion de registros
+        BLOCK_K = 32   # reducido para dejar espacio a BLOCK_M y BLOCK_D
         grid = (triton.cdiv(M, BLOCK_M),)
 
         flash_vl_fwd_kernel[grid](
@@ -514,7 +507,7 @@ if HAS_TRITON:
             pv_c.stride(0), pv_c.stride(1),
             out.stride(0),  out.stride(1),
             BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D,
-            num_warps=8, num_stages=3,
+            num_warps=4, num_stages=2,
         )
 
         # Copiar activity de vuelta (atomic_add escribió en act_c)
