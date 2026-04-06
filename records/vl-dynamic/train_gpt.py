@@ -933,15 +933,20 @@ def main():
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Inicializar centros VL con embeddings reales
+    # Inicializar centros VL con embeddings reales del primer batch
+    # Sin esto, centros aleatorios en 512d → dist_coseno ≈ 0.5 siempre → phi = 0
     with torch.no_grad():
-        x_init, _ = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-        emb = base_model.tok_emb(x_init.to(device)[:, :64].reshape(-1))
-        emb_norm = F.normalize(emb, p=2, dim=-1)
+        x_init, _ = train_loader.next_batch(
+            args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+        emb = base_model.tok_emb(x_init.to(device)[:8, :64].reshape(-1))
+        emb_norm = F.normalize(emb.float(), p=2, dim=-1)
         for block in base_model.blocks:
             k = int(block.mlp.k_active.item())
             idx = torch.randint(0, emb_norm.shape[0], (k,))
-            block.mlp.centers.data[:k] = emb_norm[idx]
+            block.mlp.centers.data[:k] = emb_norm[idx].to(block.mlp.centers.dtype)
+        del x_init, emb, emb_norm
+        torch.cuda.empty_cache()
+    print("VL centers initialized from real embeddings")
 
     # Warmup
     if args.warmup_steps > 0:
