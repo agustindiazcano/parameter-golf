@@ -819,7 +819,23 @@ def main():
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(args, model, rank, world_size, device,
                                          grad_accum_steps, val_tokens, bb_lut, hls_lut, ibt_lut)
-            avg_sp = 0.0  # simplificado por ahora
+            with torch.no_grad():
+                base_model.eval()
+                x_sp = val_tokens[:64].to(device).long().unsqueeze(0)
+                x_sp = x_sp[:, :args.train_seq_len]
+                emb_sp = base_model.tok_emb(x_sp)
+                emb_sp = F.rms_norm(emb_sp, (emb_sp.size(-1),))
+                h_sp   = emb_sp + base_model.blocks[0].attn_scale.float()[None,None,:] * \
+                         base_model.blocks[0].attn(base_model.blocks[0].attn_norm(emb_sp))
+                h_f    = h_sp.reshape(-1, args.model_dim).float()
+                h_norm = F.normalize(h_f, p=2, dim=-1)
+                vl     = base_model.blocks[0].mlp
+                c_norm = F.normalize(vl.centers, p=2, dim=-1)
+                radii  = F.softplus(vl.log_radii) + 0.01
+                dist   = 1.0 - (h_norm @ c_norm.T)
+                phi    = torch.relu(1.0 - dist / radii.unsqueeze(0))
+                avg_sp = float((phi == 0).float().mean().item())
+                base_model.train()
             avg_k  = sum(int(b.mlp.k_active.item()) for b in base_model.blocks) / len(base_model.blocks)
             log0(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                  f"vl_sparsity:{avg_sp:.1%} vl_k_avg:{avg_k:.0f} "
