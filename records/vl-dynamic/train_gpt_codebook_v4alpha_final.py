@@ -65,7 +65,7 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     # MLP_MULT subido de 2 a 3 — posible gracias al ahorro del codebook
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))  # 0=desatado
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -275,27 +275,34 @@ class DistributedTokenLoader:
 
 def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
     """
-    Cuantiza el embedding con K-means codebook.
+    KMeans PyTorch puro — sin dependencias externas.
     weight: (vocab_size, dim) en float32
-    Retorna: indices (vocab_size,) uint8, codebook (n_codes, dim) float16
-    Ahorro: vocab*dim*2 bytes → n_codes*dim*2 + vocab*1 bytes
-    Para vocab=1024, dim=512, n_codes=256:
-      Original: 1024*512*2 = 1,048,576 bytes (~1MB)
-      Codebook: 256*512*2 + 1024*1 = 263,168 bytes (~257KB)
-      Ahorro: ~4x
+    Returns: indices (vocab_size,) uint8, codebook (n_codes, dim) float32, mse float
     """
-    from sklearn.cluster import MiniBatchKMeans
-    w = weight.float().cpu().numpy()
-    km = MiniBatchKMeans(n_clusters=n_codes, n_init=5, max_iter=300,
-                         batch_size=min(1024, len(w)), random_state=42)
-    km.fit(w)
-    indices  = km.labels_.astype(np.uint8)          # (vocab_size,)
-    codebook = km.cluster_centers_.astype(np.float32)  # (n_codes, dim)
-    # Calcular error de reconstrucción
-    reconstructed = codebook[indices]
-    mse = float(np.mean((w - reconstructed) ** 2))
+    w = weight.float().cpu()
+    vocab_size, dim = w.shape
+    torch.manual_seed(42)
+    perm = torch.randperm(vocab_size)[:n_codes]
+    centers = w[perm].clone()
+    labels = torch.zeros(vocab_size, dtype=torch.long)
+    for _ in range(300):
+        dists = torch.cdist(w, centers)
+        new_labels = dists.argmin(dim=1)
+        new_centers = torch.zeros_like(centers)
+        for k in range(n_codes):
+            mask = new_labels == k
+            if mask.any():
+                new_centers[k] = w[mask].mean(dim=0)
+            else:
+                new_centers[k] = centers[k]
+        if (new_labels == labels).all():
+            break
+        labels = new_labels
+        centers = new_centers
+    indices = labels.numpy().astype(np.uint8)
+    codebook = centers.numpy().astype(np.float32)
+    mse = float(np.mean((w.numpy() - codebook[indices]) ** 2))
     return indices, codebook, mse
-
 
 def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> Tensor:
     """Reconstruye el embedding desde codebook + indices."""
@@ -334,19 +341,23 @@ def keep_float_tensor(name, t, passthrough_orig_dtypes):
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t):
+def quantize_float_tensor(t, bits=6, k=12.85):
+    """SDClip: c = k * std(row) — Kevin Clark (2026)."""
     t32 = t.float()
+    half_levels = (1 << (bits - 1)) - 1  # 6 bits → 31
     if t32.ndim == 2:
-        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.empty((t32.shape[0],))
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(INT8_PER_ROW_SCALE_DTYPE).contiguous()
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+        std_dev = t32.std(dim=1, keepdim=True).clamp_min(1e-7)
+        clip_abs = k * std_dev
+        clipped = torch.maximum(torch.minimum(t32, clip_abs), -clip_abs)
+        scale = (clip_abs / float(half_levels)).clamp_min(1e-7)
+        q = torch.clamp(torch.round(clipped / scale), -half_levels, half_levels).to(torch.int8).contiguous()
+        return q, scale.to(torch.float16).contiguous()
+    std_dev = float(t32.std().clamp_min(1e-7).item())
+    clip_abs_val = k * std_dev
+    scale = torch.tensor(clip_abs_val / float(half_levels))
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs_val, clip_abs_val) / scale),
+                    -half_levels, half_levels).to(torch.int8).contiguous()
     return q, scale
-
 
 def quantize_state_dict_codebook(state_dict, codebook_size=256):
     """
@@ -560,8 +571,10 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if not self.tie_embeddings and self.lm_head is not None:
+            nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.tied_embed_init_std)
+            self.lm_head._zero_init = False
         for m in self.modules():
             if isinstance(m, nn.Linear) and getattr(m, "_zero_init", False):
                 nn.init.zeros_(m.weight)
@@ -578,8 +591,7 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
         lp = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(lp / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        return ce_loss
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 # -----------------------------
 # TRAINING
@@ -759,15 +771,24 @@ def main():
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = model(x, y)
-            # Volumetric Repulsion: forzar ortogonalidad en pesos MLP
+            # Volumetric Repulsion: MLP + Embedding
             if args.vl_lambda > 0:
                 rep_loss = torch.zeros((), device=device, dtype=torch.float32)
+                # 1. Repulsión MLP
                 for block in base_model.blocks:
                     w = block.mlp.fc.weight.float()
                     w_norm = F.normalize(w, p=2, dim=1)
                     sim = torch.mm(w_norm, w_norm.t())
                     sim = sim - torch.eye(sim.size(0), device=device)
                     rep_loss = rep_loss + torch.relu(sim).mean()
+                # 2. Repulsión Embedding (muestra aleatoria)
+                idx = torch.randint(0, base_model.tok_emb.weight.size(0),
+                                    (args.vl_sample_size,), device=device)
+                emb_w = base_model.tok_emb.weight[idx].float()
+                emb_norm = F.normalize(emb_w, p=2, dim=1)
+                emb_sim = torch.mm(emb_norm, emb_norm.t())
+                emb_sim = emb_sim - torch.eye(args.vl_sample_size, device=device)
+                rep_loss = rep_loss + args.vl_emb_lambda * torch.relu(emb_sim).mean()
                 loss = loss + args.vl_lambda * rep_loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -834,6 +855,9 @@ def main():
     with open("final_model.codebook.ptz", "rb") as f: blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(blob_disk)), map_location="cpu", weights_only=False)
     base_model.load_state_dict(dequantize_state_dict_codebook(quant_state), strict=True)
+    # Recompilar para que el grafo use los pesos deserializados
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)         if distributed else compiled_model
     torch.cuda.synchronize(); t_q = time.perf_counter()
     q_loss, q_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
                               val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)

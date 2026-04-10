@@ -51,6 +51,8 @@ nohup torchrun --standalone --nproc_per_node=2 \
   records/vl-dynamic/train_gpt_codebook_v5.py \
   > logs/codebook_v5_final.log 2>&1 &
 
+tail -f logs/codebook_v5_final.log
+
 # V4-Alpha — codebook + repulsión
 RUN_ID=codebook_v4alpha \
 SEED=1337 \
@@ -61,6 +63,8 @@ nohup torchrun --standalone --nproc_per_node=2 \
   records/vl-dynamic/train_gpt_codebook_v4alpha.py \
   > logs/codebook_v4alpha.log 2>&1 &
 
+tail -f logs/codebook_v4alpha.log
+
 # V6 — codebook + VSingularity
 RUN_ID=codebook_v6 \
 SEED=1337 \
@@ -70,3 +74,5 @@ TIE_EMBEDDINGS=0 \
 nohup torchrun --standalone --nproc_per_node=2 \
   records/vl-dynamic/train_gpt_codebook_v6.py \
   > logs/codebook_v6.log 2>&1 &
+
+tail -f logs/codebook_v6.log
