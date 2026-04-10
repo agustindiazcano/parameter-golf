@@ -3,7 +3,10 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 
 Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 
-MODIFICACIÓN V2 FIXED: Codebook + INT6 QAT + Clip calibrado (99.90%) + MLP_MULT=4
+MODIFICACIÓN V2 FIXED v2: Codebook tok_emb (desatado) + INT6 QAT + Clip 99.90% + MLP_MULT=4
+- tok_emb: codebook K-means 256 prototipos (~257KB)
+- lm_head: desatado, cuantizado INT6 per-row (~350KB)
+- Ahorro total vs baseline: ~400KB → MLP_MULT=4
 - Durante entrenamiento: embedding normal en bfloat16
 - INT6 QAT (Straight-Through Estimator) activado al 85% del entrenamiento
 - En serialización: K-means codebook de 256 prototipos para tok_emb
@@ -66,7 +69,7 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     # MLP_MULT subido de 2 a 3 — posible gracias al ahorro del codebook
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))  # 0=desatado: codebook en tok_emb, INT6 en lm_head
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -301,7 +304,7 @@ def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
 def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> Tensor:
     """Reconstruye el embedding desde codebook + indices."""
     reconstructed = codebook[indices]  # (vocab_size, dim) en float16
-    return torch.from_numpy(reconstructed.astype(np.float32)).bfloat16()
+    return torch.from_numpy(reconstructed.astype(np.float32))
 
 # -----------------------------
 # QUANTIZATION INT8 MODIFICADA
