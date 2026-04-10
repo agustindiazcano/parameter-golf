@@ -3,12 +3,13 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 
 Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 
-MODIFICATION: Codebook Quantization for embeddings
+MODIFICATION V3: Codebook + INT6 QAT + Fused Softcap Cross-Entropy (Triton)
 - During training: normal embedding in bfloat16
+- INT6 QAT (Straight-Through Estimator) activated at 85% of training
 - In serialization: K-means codebook of 256 prototypes for tok_emb
-- Ahorro: ~1MB → ~257KB en el embedding (4x)
+- Ahorro embedding: ~1MB → ~257KB (4x)
 - El presupuesto liberado se usa en MLP_MULT más alto (2→3)
-- Everything else same as OpenAI baseline
+- Serialization in INT6 per-row (31 levels) for attention and MLP
 """
 
 from __future__ import annotations
@@ -33,6 +34,130 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# ==============================================================================
+# FUSED SOFTCAPPED CROSS-ENTROPY — Triton Megakernel
+# Elimina la materialización de logits en HBM.
+# Forward: lp → softcap → tanh → log_softmax → NLL en una sola pasada SRAM.
+# Backward: gradiente analítico del softcap-CE sin recomputar el forward.
+# Compatible con torch.compile y bfloat16.
+# ==============================================================================
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
+if HAS_TRITON:
+    @triton.jit
+    def _softcap_ce_fwd_kernel(
+        logits_ptr, targets_ptr, loss_ptr, lse_ptr,
+        softcap: tl.constexpr,
+        n_cols: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < n_cols
+
+        # Leer logits crudos a SRAM
+        lp = tl.load(logits_ptr + row * n_cols + cols, mask=mask, other=-1e9).to(tl.float32)
+
+        # Softcap in-place en registros
+        sc = softcap * tl.libdevice.tanh(lp / softcap)
+
+        # Estabilidad numérica: restar el máximo
+        m = tl.max(tl.where(mask, sc, -1e9), axis=0)
+        shifted = sc - m
+        exp_s = tl.exp(shifted)
+        sum_exp = tl.sum(tl.where(mask, exp_s, 0.0), axis=0)
+        lse = tl.log(sum_exp) + m  # log-sum-exp
+
+        # Target logit softcapeado
+        target = tl.load(targets_ptr + row)
+        target_lp = tl.load(logits_ptr + row * n_cols + target).to(tl.float32)
+        target_sc = softcap * tl.libdevice.tanh(target_lp / softcap)
+
+        # Loss = -target_sc + lse
+        loss = -target_sc + lse
+        tl.store(loss_ptr + row, loss)
+        tl.store(lse_ptr + row, lse)
+
+    @triton.jit
+    def _softcap_ce_bwd_kernel(
+        logits_ptr, targets_ptr, lse_ptr, grad_logits_ptr,
+        grad_loss,
+        softcap: tl.constexpr,
+        n_cols: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < n_cols
+
+        lp = tl.load(logits_ptr + row * n_cols + cols, mask=mask, other=-1e9).to(tl.float32)
+        lse = tl.load(lse_ptr + row).to(tl.float32)
+        target = tl.load(targets_ptr + row)
+
+        # Softcap + derivada: d(softcap*tanh(x/sc))/dx = 1 - tanh²(x/sc)
+        t = tl.libdevice.tanh(lp / softcap)
+        sc = softcap * t
+        d_sc_d_lp = 1.0 - t * t  # derivada del softcap
+
+        # Softmax en espacio softcapeado
+        softmax_val = tl.exp(sc - lse)
+
+        # Gradiente de CE respecto al logit softcapeado
+        one_hot = (cols == target).to(tl.float32)
+        d_ce_d_sc = softmax_val - one_hot
+
+        # Regla de la cadena: d_ce/d_lp = d_ce/d_sc * d_sc/d_lp
+        grad = grad_loss * d_ce_d_sc * d_sc_d_lp
+
+        tl.store(grad_logits_ptr + row * n_cols + cols, grad.to(tl.bfloat16), mask=mask)
+
+    class FusedSoftcapCrossEntropy(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, logits, targets, softcap):
+            # logits: (N, V) float32 o bfloat16
+            # targets: (N,) int64
+            logits_f = logits.float().contiguous()
+            N, V = logits_f.shape
+            BLOCK = triton.next_power_of_2(V)
+            loss = torch.empty(N, device=logits.device, dtype=torch.float32)
+            lse  = torch.empty(N, device=logits.device, dtype=torch.float32)
+            _softcap_ce_fwd_kernel[(N,)](
+                logits_f, targets, loss, lse,
+                softcap=softcap, n_cols=V, BLOCK=BLOCK,
+                num_warps=4,
+            )
+            ctx.save_for_backward(logits_f, targets, lse)
+            ctx.softcap = softcap
+            return loss.mean()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            logits_f, targets, lse = ctx.saved_tensors
+            N, V = logits_f.shape
+            BLOCK = triton.next_power_of_2(V)
+            grad_logits = torch.empty_like(logits_f, dtype=torch.bfloat16)
+            _softcap_ce_bwd_kernel[(N,)](
+                logits_f, targets, lse, grad_logits,
+                grad_loss=grad_output.item() / N,
+                softcap=ctx.softcap, n_cols=V, BLOCK=BLOCK,
+                num_warps=4,
+            )
+            return grad_logits.float(), None, None
+
+    def fused_softcap_ce(lp, targets, softcap):
+        return FusedSoftcapCrossEntropy.apply(lp, targets, softcap)
+
+else:
+    def fused_softcap_ce(lp, targets, softcap):
+        logits = softcap * torch.tanh(lp / softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -339,12 +464,12 @@ def quantize_float_tensor(t):
     if t32.ndim == 2:
         clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.empty((t32.shape[0],))
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -31, 31).to(torch.int8).contiguous()
         return q, scale.to(INT8_PER_ROW_SCALE_DTYPE).contiguous()
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
 
@@ -444,9 +569,16 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
+    qat_enabled: bool = False
+
     def forward(self, x):
+        w = self.weight
+        if self.qat_enabled:
+            scale = (w.abs().amax(dim=1, keepdim=True) / 31.0).clamp_min(1e-7)
+            w_q = torch.clamp(torch.round(w / scale), -31, 31) * scale
+            w = w + (w_q - w).detach()  # Straight-Through Estimator
         b = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), b)
+        return F.linear(x, w.to(x.dtype), b)
 
 
 def restore_low_dim_params_to_fp32(module):
@@ -577,8 +709,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         lp = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(lp / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return fused_softcap_ce(lp, targets, self.logit_softcap)
 
 # -----------------------------
 # TRAINING
@@ -749,6 +880,13 @@ def main():
                 log0(f"stopping_early: wallclock_cap step:{step}/{args.iterations}")
             break
 
+        # Activate INT6 QAT at 85% of training
+        if not CastedLinear.qat_enabled:
+            elapsed_frac = (training_time_ms + 1000.0*(time.perf_counter()-t0)) / max(max_wallclock_ms or 1e9, 1)
+            if elapsed_frac >= 0.85:
+                CastedLinear.qat_enabled = True
+                log0(f"INT6 QAT activated at step {step} ({elapsed_frac*100:.1f}% of time)")
+
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
@@ -812,24 +950,24 @@ def main():
     quant_blob = zlib.compress(quant_raw, level=9)
 
     if master_process:
-        with open("final_model.codebook.ptz", "wb") as f: f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.codebook.ptz")
+        with open("final_model.codebook_int6_triton.ptz", "wb") as f: f.write(quant_blob)
+        quant_file_bytes = os.path.getsize("final_model.codebook_int6_triton.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["payload_bytes"], 1)
-        log0(f"Serialized codebook+int8+zlib: {quant_file_bytes} bytes "
+        log0(f"Serialized codebook+int6+zlib: {quant_file_bytes} bytes "
              f"(ratio:{ratio:.2f}x) total:{quant_file_bytes + code_bytes} bytes")
 
     if distributed: dist.barrier()
-    with open("final_model.codebook.ptz", "rb") as f: blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(blob_disk)), map_location="cpu")
+    with open("final_model.codebook_int6_triton.ptz", "rb") as f: blob_disk = f.read()
+    quant_state = torch.load(io.BytesIO(zlib.decompress(blob_disk)), map_location="cpu", weights_only=False)
     base_model.load_state_dict(dequantize_state_dict_codebook(quant_state), strict=True)
     torch.cuda.synchronize(); t_q = time.perf_counter()
     q_loss, q_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
                               val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
     torch.cuda.synchronize()
-    log0(f"final_codebook_zlib_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f} "
+    log0(f"final_codebook_v3_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f} "
          f"eval_time:{1000*(time.perf_counter()-t_q):.0f}ms")
-    log0(f"final_codebook_zlib_roundtrip_exact val_loss:{q_loss:.8f} val_bpb:{q_bpb:.8f}")
+    log0(f"final_codebook_v3_roundtrip_exact val_loss:{q_loss:.8f} val_bpb:{q_bpb:.8f}")
 
     if distributed: dist.destroy_process_group()
 
