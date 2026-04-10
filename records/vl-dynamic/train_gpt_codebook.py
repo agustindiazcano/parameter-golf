@@ -300,7 +300,7 @@ def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
 def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> Tensor:
     """Reconstructs the embedding from codebook + indices."""
     reconstructed = codebook[indices]  # (vocab_size, dim) en float16
-    return torch.from_numpy(reconstructed.astype(np.float32)).bfloat16()
+    return torch.from_numpy(reconstructed.astype(np.float32))
 
 # -----------------------------
 # MODIFIED INT8 QUANTIZATION
@@ -334,18 +334,25 @@ def keep_float_tensor(name, t, passthrough_orig_dtypes):
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t):
+def quantize_float_tensor(t, bits=6, k=12.85):
+    """SDClip: c = k * std(row) — más principiado que percentil."""
     t32 = t.float()
+    half_levels = (1 << (bits - 1)) - 1  # 6 bits → 31
+
     if t32.ndim == 2:
-        clip_abs = 12.85 * t32.std(dim=1)
-        clip_abs = clip_abs.clamp_min(1e-7)
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -31, 31).to(torch.int8).contiguous()
-        return q, scale.to(INT8_PER_ROW_SCALE_DTYPE).contiguous()
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
+        std_dev = t32.std(dim=1, keepdim=True).clamp_min(1e-7)
+        clip_abs = k * std_dev
+        clipped = torch.maximum(torch.minimum(t32, clip_abs), -clip_abs)
+        scale = (clip_abs / float(half_levels)).clamp_min(1e-7)
+        q = torch.clamp(torch.round(clipped / scale), -half_levels, half_levels).to(torch.int8).contiguous()
+        return q, scale.to(torch.float16).contiguous()
+
+    # Vectores/escalares — std global
+    std_dev = float(t32.std().clamp_min(1e-7).item())
+    clip_abs_val = k * std_dev
+    scale = torch.tensor(clip_abs_val / float(half_levels))
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs_val, clip_abs_val) / scale),
+                    -half_levels, half_levels).to(torch.int8).contiguous()
     return q, scale
 
 
