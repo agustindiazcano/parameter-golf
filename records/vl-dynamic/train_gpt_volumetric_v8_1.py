@@ -1,8 +1,9 @@
 """
-MODIFICACIÓN V8.1: Cuantización Adaptativa + Memoria Volumétrica + L1 Pruning
-- Cuantización guiada por varianza de activaciones (Díaz-Cano, 2026).
-- Memoria Volumétrica: Reemplazo de F.linear por Similitud Coseno en el lm_head (Tolerancia a fallos de cuantización).
+MODIFICACIÓN V8.1 (VERSIÓN 1024 BPE): Cuantización Adaptativa + Memoria Volumétrica + L1 Pruning
+- Cuantización guiada por varianza de activaciones.
+- Memoria Volumétrica: Reemplazo de F.linear por Similitud Coseno en el lm_head (Tolerancia a fallos).
 - L1 Pruning Condicional: Activado vía ENABLE_PRUNING=1 para comprimir aún más con Zlib.
+- RUTAS FIJAS A SP1024 (10 Shards).
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------
-# HYPERPARAMETERS
+# HYPERPARAMETERS (FIJADOS A 1024)
 # -----------------------------
 
 class Hyperparameters:
@@ -38,7 +39,6 @@ class Hyperparameters:
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
     
-    # Toggle para Pruning
     enable_pruning = bool(int(os.environ.get("ENABLE_PRUNING", "0")))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -79,11 +79,6 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     codebook_size = int(os.environ.get("CODEBOOK_SIZE", 256))
-
-    vl_lambda = float(os.environ.get("VL_LAMBDA", 0.0))
-    vl_emb_lambda = float(os.environ.get("VL_EMB_LAMBDA", 0.5))
-    vl_sample_size = int(os.environ.get("VL_SAMPLE_SIZE", 512))
-
     calib_batches = int(os.environ.get("CALIB_BATCHES", 8))
     sdclip_k_base = float(os.environ.get("SDCLIP_K_BASE", 12.85))
     sdclip_k_min = float(os.environ.get("SDCLIP_K_MIN", 6.0))
@@ -92,7 +87,6 @@ class Hyperparameters:
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
-
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -108,7 +102,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
-
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -118,10 +111,9 @@ class Muon(torch.optim.Optimizer):
         world_size = dist.get_world_size() if distributed else 1
         rank = dist.get_rank() if distributed else 0
         for group in self.param_groups:
-            params = group["params"]
-            if not params: continue
-            lr = group["lr"]; momentum = group["momentum"]
+            params = group["params"]; lr = group["lr"]; momentum = group["momentum"]
             backend_steps = group["backend_steps"]; nesterov = group["nesterov"]
+            if not params: continue
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
             curr = 0
@@ -146,9 +138,8 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 # -----------------------------
-# TOKENIZER / EVAL / DATA
+# DATA LOADERS & EVAL
 # -----------------------------
-
 def build_sentencepiece_luts(sp, vocab_size, device):
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
@@ -166,17 +157,23 @@ def build_sentencepiece_luts(sp, vocab_size, device):
             torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
             torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device))
 
+def load_data_shard(file: Path) -> Tensor:
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1: raise ValueError(f"Unexpected shard header for {file}")
+    num_tokens = int(header[2])
+    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
+    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+
 def load_validation_tokens(pattern, seq_len):
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files: raise FileNotFoundError(f"No files found for pattern: {pattern}")
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
-    if usable <= 0: raise ValueError(f"Validation split too short")
     return tokens[:usable + 1]
 
 def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut):
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len: raise ValueError("VAL_BATCH_SIZE too small")
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
@@ -210,20 +207,9 @@ def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens
     model.train()
     return float(val_loss.item()), float(bpt * tpb)
 
-def load_data_shard(file: Path) -> Tensor:
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    header = np.fromfile(file, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1: raise ValueError(f"Unexpected shard header")
-    num_tokens = int(header[2])
-    expected_size = header_bytes + num_tokens * np.dtype("<u2").itemsize
-    if file.stat().st_size != expected_size: raise ValueError(f"Shard size mismatch")
-    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
-    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
-
 class TokenStream:
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files: raise FileNotFoundError(f"No files found for pattern")
         self.file_idx = 0; self.tokens = load_data_shard(self.files[0]); self.pos = 0
     def _advance_file(self):
         self.file_idx = (self.file_idx + 1) % len(self.files)
@@ -250,10 +236,9 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len); y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-# ==============================================================================
+# -----------------------------
 # CODEBOOK K-MEANS
-# ==============================================================================
-
+# -----------------------------
 def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
     w = weight.float().cpu()
     vocab_size, dim = w.shape
@@ -279,10 +264,9 @@ def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
 def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> Tensor:
     return torch.from_numpy(codebook[indices].astype(np.float32))
 
-# ==============================================================================
-# CUANTIZACIÓN ADAPTATIVA POR VARIANZA DE ACTIVACIÓN
-# ==============================================================================
-
+# -----------------------------
+# CUANTIZACIÓN ADAPTATIVA (Díaz-Cano)
+# -----------------------------
 def collect_activation_stats(model, train_loader, device, n_batches=8, seq_len=1024, grad_accum_steps=4, train_batch_tokens=524288):
     activation_stats = {}
     hooks = []
@@ -330,10 +314,6 @@ def quantize_float_tensor_adaptive(t, k_base=12.85, k_min=6.0, k_max=32.0, row_i
     scale = torch.tensor(clip_abs_val / float(half_levels))
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs_val, clip_abs_val) / scale), -half_levels, half_levels).to(torch.int8).contiguous()
     return q, scale
-
-# -----------------------------
-# CONTROL TENSORS
-# -----------------------------
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(pattern for pattern in os.environ.get("CONTROL_TENSOR_NAME_PATTERNS", "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights").split(",") if pattern)
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(pattern for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_NAME_PATTERNS", ",".join(CONTROL_TENSOR_NAME_PATTERNS)).split(",") if pattern)
@@ -398,9 +378,8 @@ def dequantize_state_dict_adaptive(obj):
     return out
 
 # -----------------------------
-# TRANSFORMER MODULES
+# TRANSFORMER MODULES (VOLUMETRIC)
 # -----------------------------
-
 class RMSNorm(nn.Module):
     def __init__(self, eps=None): super().__init__(); self.eps = eps
     def forward(self, x): return F.rms_norm(x, (x.size(-1),), eps=self.eps)
@@ -506,32 +485,26 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         
         # ==================================================================
-        # MEMORIA VOLUMÉTRICA (Esferas Difusas Solapadas)
+        # MEMORIA VOLUMÉTRICA (Esferas Difusas)
         # ==================================================================
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         
         w_head = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
         
-        # Normalización geométrica pura (Superficie de la hiperesfera)
         x_norm = F.normalize(x, p=2, dim=-1)
         w_norm = F.normalize(w_head, p=2, dim=-1)
         
-        # Similitud Coseno
         cosine_sim = F.linear(x_norm, w_norm)
-        
-        # Radio de Difusidad (Inverso de la Temperatura)
         volumetric_radius = 30.0 
         lp = cosine_sim * volumetric_radius
         
-        # Softcap de los logits para evitar explosiones
         logits = self.logit_softcap * torch.tanh(lp / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 # -----------------------------
-# TRAINING
+# MAIN TRAINING LOOP
 # -----------------------------
-
 def main():
     global zeropower_via_newtonschulz5
     code = Path(__file__).read_text(encoding="utf-8")
@@ -597,7 +570,6 @@ def main():
     scalar_params = [p for name, p in block_named_params if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
     if base_model.skip_weights.numel() > 0: scalar_params.append(base_model.skip_weights)
 
-    # Identificar pesos del MLP para Pruning L1 rápido
     mlp_params = [p for name, p in base_model.named_parameters() if "mlp.fc" in name or "mlp.proj" in name]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -667,7 +639,6 @@ def main():
             break
 
         elapsed_frac = (training_time_ms + 1000.0*(time.perf_counter()-t0)) / max_wallclock_ms if max_wallclock_ms else step / args.iterations
-
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
@@ -681,9 +652,6 @@ def main():
             
             total_loss = loss * grad_scale
             
-            # ==========================================================
-            # VACÍO L1 (PRUNING) - Activo desde el 50% si ENABLE_PRUNING=1
-            # ==========================================================
             if args.enable_pruning and elapsed_frac > 0.50:
                 l1_penalty = sum(p.abs().sum() for p in mlp_params)
                 l1_lambda = 1e-5 * ((elapsed_frac - 0.50) / 0.50)
@@ -715,9 +683,6 @@ def main():
 
     log0(f"peak memory: {torch.cuda.max_memory_allocated()//1024//1024} MiB")
 
-    # ==================================================================
-    # CALIBRACIÓN + SERIALIZACIÓN ADAPTATIVA
-    # ==================================================================
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
@@ -729,10 +694,8 @@ def main():
     t_calib = time.perf_counter()
     activation_stats = collect_activation_stats(
         base_model, calib_loader, device,
-        n_batches=args.calib_batches,
-        seq_len=args.train_seq_len,
-        grad_accum_steps=grad_accum_steps,
-        train_batch_tokens=args.train_batch_tokens,
+        n_batches=args.calib_batches, seq_len=args.train_seq_len,
+        grad_accum_steps=grad_accum_steps, train_batch_tokens=args.train_batch_tokens,
     )
     log0(f"Calibración completada en {time.perf_counter()-t_calib:.1f}s — {len(activation_stats)} capas")
 
@@ -740,13 +703,9 @@ def main():
     log0(f"Cuantización adaptativa: use_codebook={use_codebook} k_base={args.sdclip_k_base}")
 
     quant_obj, quant_stats = quantize_state_dict_adaptive(
-        base_model.state_dict(),
-        activation_stats=activation_stats,
-        codebook_size=args.codebook_size,
-        use_codebook=use_codebook,
-        k_base=args.sdclip_k_base,
-        k_min=args.sdclip_k_min,
-        k_max=args.sdclip_k_max,
+        base_model.state_dict(), activation_stats=activation_stats,
+        codebook_size=args.codebook_size, use_codebook=use_codebook,
+        k_base=args.sdclip_k_base, k_min=args.sdclip_k_min, k_max=args.sdclip_k_max,
     )
 
     quant_buf = io.BytesIO()
