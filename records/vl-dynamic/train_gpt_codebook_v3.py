@@ -65,7 +65,7 @@ if HAS_TRITON:
         lp = tl.load(logits_ptr + row * n_cols + cols, mask=mask, other=-1e9).to(tl.float32)
 
         # Softcap in-place en registros
-        sc = softcap * tl.libdevice.tanh(lp / softcap)
+        sc = softcap * tl.math.tanh(lp / softcap)
 
         # Estabilidad numérica: restar el máximo
         m = tl.max(tl.where(mask, sc, -1e9), axis=0)
@@ -77,7 +77,7 @@ if HAS_TRITON:
         # Target logit softcapeado
         target = tl.load(targets_ptr + row)
         target_lp = tl.load(logits_ptr + row * n_cols + target).to(tl.float32)
-        target_sc = softcap * tl.libdevice.tanh(target_lp / softcap)
+        target_sc = softcap * tl.math.tanh(target_lp / softcap)
 
         # Loss = -target_sc + lse
         loss = -target_sc + lse
@@ -87,7 +87,7 @@ if HAS_TRITON:
     @triton.jit
     def _softcap_ce_bwd_kernel(
         logits_ptr, targets_ptr, lse_ptr, grad_logits_ptr,
-        grad_loss,
+        grad_loss_ptr,
         softcap: tl.constexpr,
         n_cols: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -100,10 +100,13 @@ if HAS_TRITON:
         lse = tl.load(lse_ptr + row).to(tl.float32)
         target = tl.load(targets_ptr + row)
 
+        # Leer grad_loss desde puntero — permanece en GPU, sin .cpu()/.item()
+        grad_loss = tl.load(grad_loss_ptr).to(tl.float32)
+
         # Softcap + derivada: d(softcap*tanh(x/sc))/dx = 1 - tanh²(x/sc)
-        t = tl.libdevice.tanh(lp / softcap)
+        t = tl.math.tanh(lp / softcap)
         sc = softcap * t
-        d_sc_d_lp = 1.0 - t * t  # derivada del softcap
+        d_sc_d_lp = 1.0 - t * t
 
         # Softmax en espacio softcapeado
         softmax_val = tl.exp(sc - lse)
@@ -142,11 +145,11 @@ if HAS_TRITON:
             N, V = logits_f.shape
             BLOCK = triton.next_power_of_2(V)
             grad_logits = torch.empty_like(logits_f, dtype=torch.bfloat16)
-            # grad_output es escalar — usamos float() para evitar .item() incompatible con compile
-            grad_scalar = float(grad_output.detach().cpu()) / N
+            # Dividir por N en GPU — no extraer a CPU
+            grad_loss_tensor = (grad_output / N).contiguous()
             _softcap_ce_bwd_kernel[(N,)](
                 logits_f, targets, lse, grad_logits,
-                grad_loss=grad_scalar,
+                grad_loss_tensor,
                 softcap=ctx.softcap, n_cols=V, BLOCK=BLOCK,
                 num_warps=4,
             )

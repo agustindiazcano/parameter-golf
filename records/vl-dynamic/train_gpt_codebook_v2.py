@@ -301,7 +301,7 @@ def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
 def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> Tensor:
     """Reconstruye el embedding desde codebook + indices."""
     reconstructed = codebook[indices]  # (vocab_size, dim) en float16
-    return torch.from_numpy(reconstructed.astype(np.float32))
+    return torch.from_numpy(reconstructed.astype(np.float32)).bfloat16()
 
 # -----------------------------
 # QUANTIZATION INT8 MODIFICADA
