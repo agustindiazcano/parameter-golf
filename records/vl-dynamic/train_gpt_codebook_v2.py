@@ -313,7 +313,7 @@ def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "lm_head,attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",") if pattern
 )
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
