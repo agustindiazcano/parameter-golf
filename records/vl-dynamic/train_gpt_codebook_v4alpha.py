@@ -3,12 +3,12 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 
 Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 
-MODIFICATION: Codebook Quantization for embeddings
-- During training: normal embedding in bfloat16
-- In serialization: K-means codebook of 256 prototypes for tok_emb
+MODIFICACIÓN: Codebook Quantization para embeddings
+- Durante entrenamiento: embedding normal en bfloat16
+- En serialización: K-means codebook de 256 prototipos para tok_emb
 - Ahorro: ~1MB → ~257KB en el embedding (4x)
 - El presupuesto liberado se usa en MLP_MULT más alto (2→3)
-- Everything else same as OpenAI baseline
+- Todo lo demás igual al baseline de OpenAI
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Codebook params
-    codebook_size = int(os.environ.get("CODEBOOK_SIZE", 256))  # 2^8 prototypes
+    codebook_size = int(os.environ.get("CODEBOOK_SIZE", 256))  # 2^8 prototipos
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -269,15 +269,15 @@ class DistributedTokenLoader:
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # ==============================================================================
-# CODEBOOK QUANTIZATION FOR EMBEDDINGS
-# Saves ~750KB in tok_emb which is reinvested in a higher MLP_MULT
+# CODEBOOK QUANTIZATION PARA EMBEDDINGS
+# Ahorra ~750KB en tok_emb que se reinvierte en MLP_MULT más alto
 # ==============================================================================
 
 def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
     """
-    Quantizes the embedding with K-means codebook.
+    Cuantiza el embedding con K-means codebook.
     weight: (vocab_size, dim) en float32
-    Returns: indices (vocab_size,) uint8, codebook (n_codes, dim) float16
+    Retorna: indices (vocab_size,) uint8, codebook (n_codes, dim) float16
     Ahorro: vocab*dim*2 bytes → n_codes*dim*2 + vocab*1 bytes
     Para vocab=1024, dim=512, n_codes=256:
       Original: 1024*512*2 = 1,048,576 bytes (~1MB)
@@ -290,20 +290,20 @@ def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
                          batch_size=min(1024, len(w)), random_state=42)
     km.fit(w)
     indices  = km.labels_.astype(np.uint8)          # (vocab_size,)
-    codebook = km.cluster_centers_.astype(np.float16)  # (n_codes, dim)
-    # Calculate reconstruction error
+    codebook = km.cluster_centers_.astype(np.float32)  # (n_codes, dim)
+    # Calcular error de reconstrucción
     reconstructed = codebook[indices]
     mse = float(np.mean((w - reconstructed) ** 2))
     return indices, codebook, mse
 
 
 def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> Tensor:
-    """Reconstructs the embedding from codebook + indices."""
+    """Reconstruye el embedding desde codebook + indices."""
     reconstructed = codebook[indices]  # (vocab_size, dim) en float16
     return torch.from_numpy(reconstructed.astype(np.float32))
 
 # -----------------------------
-# MODIFIED INT8 QUANTIZATION
+# QUANTIZATION INT8 MODIFICADA
 # -----------------------------
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -334,36 +334,28 @@ def keep_float_tensor(name, t, passthrough_orig_dtypes):
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t, bits=6, k=12.85):
-    """SDClip: c = k * std(row) — más principiado que percentil."""
+def quantize_float_tensor(t):
     t32 = t.float()
-    half_levels = (1 << (bits - 1)) - 1  # 6 bits → 31
-
     if t32.ndim == 2:
-        std_dev = t32.std(dim=1, keepdim=True).clamp_min(1e-7)
-        clip_abs = k * std_dev
-        clipped = torch.maximum(torch.minimum(t32, clip_abs), -clip_abs)
-        scale = (clip_abs / float(half_levels)).clamp_min(1e-7)
-        q = torch.clamp(torch.round(clipped / scale), -half_levels, half_levels).to(torch.int8).contiguous()
-        return q, scale.to(torch.float16).contiguous()
-
-    # Vectores/escalares — std global
-    std_dev = float(t32.std().clamp_min(1e-7).item())
-    clip_abs_val = k * std_dev
-    scale = torch.tensor(clip_abs_val / float(half_levels))
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs_val, clip_abs_val) / scale),
-                    -half_levels, half_levels).to(torch.int8).contiguous()
+        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.empty((t32.shape[0],))
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        return q, scale.to(INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
 
 def quantize_state_dict_codebook(state_dict, codebook_size=256):
     """
-    Same as int8 but with codebook for tok_emb.
-    The embedding is saved as (indices, codebook) instead of int8 per-row.
-    Everything else continues to be int8+zlib.
+    Igual que int8 pero con codebook para tok_emb.
+    El embedding se guarda como (indices, codebook) en lugar de int8 per-row.
+    Todo lo demás sigue siendo int8+zlib.
     """
     quantized, scales, dtypes, passthrough, passthrough_orig_dtypes, qmeta = {}, {}, {}, {}, {}, {}
-    codebook_data = {}  # stores {name: (indices, codebook)} for embeddings
+    codebook_data = {}  # almacena {name: (indices, codebook)} para embeddings
     stats = dict.fromkeys(("param_count","num_tensors","num_float_tensors",
                            "num_nonfloat_tensors","baseline_tensor_bytes","payload_bytes"), 0)
 
@@ -373,7 +365,7 @@ def quantize_state_dict_codebook(state_dict, codebook_size=256):
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
 
-        # CODEBOOK for tok_emb (the main embedding)
+        # CODEBOOK para tok_emb (el embedding principal)
         if name == "tok_emb.weight" and t.ndim == 2:
             indices, codebook, mse = quantize_embedding_codebook(t, n_codes=codebook_size)
             codebook_data[name] = {
@@ -421,11 +413,11 @@ def dequantize_state_dict_codebook(obj):
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     codebook_data = obj.get("codebook_data", {})
 
-    # Reconstruct embeddings from codebook
+    # Reconstruir embeddings desde codebook
     for name, cb in codebook_data.items():
         out[name] = dequantize_embedding_codebook(cb["indices"], cb["codebook"])
 
-    # Reconstruct int8
+    # Reconstruir int8
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name]); s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
@@ -442,7 +434,7 @@ def dequantize_state_dict_codebook(obj):
     return out
 
 # -----------------------------
-# TRANSFORMER MODULES (same as baseline)
+# TRANSFORMER MODULES (igual al baseline)
 # -----------------------------
 
 class RMSNorm(nn.Module):
@@ -586,7 +578,8 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
         lp = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(lp / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        return ce_loss
 
 # -----------------------------
 # TRAINING
@@ -766,6 +759,16 @@ def main():
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = model(x, y)
+            # Volumetric Repulsion: forzar ortogonalidad en pesos MLP
+            if args.vl_lambda > 0:
+                rep_loss = torch.zeros((), device=device, dtype=torch.float32)
+                for block in base_model.blocks:
+                    w = block.mlp.fc.weight.float()
+                    w_norm = F.normalize(w, p=2, dim=1)
+                    sim = torch.mm(w_norm, w_norm.t())
+                    sim = sim - torch.eye(sim.size(0), device=device)
+                    rep_loss = rep_loss + torch.relu(sim).mean()
+                loss = loss + args.vl_lambda * rep_loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -796,7 +799,7 @@ def main():
     log0(f"peak memory: {torch.cuda.max_memory_allocated()//1024//1024} MiB")
 
     # ==================================================================
-    # SERIALIZATION WITH CODEBOOK
+    # SERIALIZACIÓN CON CODEBOOK
     # ==================================================================
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -804,11 +807,11 @@ def main():
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model (fp): {model_bytes} bytes | code: {code_bytes} bytes")
 
-    log0("Applying codebook quantization to the embedding...")
+    log0("Aplicando codebook quantization al embedding...")
     quant_obj, quant_stats = quantize_state_dict_codebook(
         base_model.state_dict(), codebook_size=args.codebook_size)
 
-    # Log codebook MSE
+    # Log MSE del codebook
     for name, cb in quant_obj.get("codebook_data", {}).items():
         log0(f"  codebook {name}: mse={cb['mse']:.6f} "
              f"indices={cb['indices'].nbytes} bytes "
