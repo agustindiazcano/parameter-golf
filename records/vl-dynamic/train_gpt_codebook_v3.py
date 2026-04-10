@@ -142,9 +142,11 @@ if HAS_TRITON:
             N, V = logits_f.shape
             BLOCK = triton.next_power_of_2(V)
             grad_logits = torch.empty_like(logits_f, dtype=torch.bfloat16)
+            # grad_output es escalar — usamos float() para evitar .item() incompatible con compile
+            grad_scalar = float(grad_output.detach().cpu()) / N
             _softcap_ce_bwd_kernel[(N,)](
                 logits_f, targets, lse, grad_logits,
-                grad_loss=grad_output.item() / N,
+                grad_loss=grad_scalar,
                 softcap=ctx.softcap, n_cols=V, BLOCK=BLOCK,
                 num_warps=4,
             )
@@ -785,7 +787,7 @@ def main():
     for m in base_model.modules():
         if isinstance(m, CastedLinear): m.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=True, fullgraph=False)
     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) \
         if distributed else compiled_model
 
