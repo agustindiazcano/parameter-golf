@@ -300,7 +300,7 @@ def quantize_embedding_codebook(weight: Tensor, n_codes: int = 256):
 def dequantize_embedding_codebook(indices: np.ndarray, codebook: np.ndarray) -> Tensor:
     """Reconstructs the embedding from codebook + indices."""
     reconstructed = codebook[indices]  # (vocab_size, dim) en float16
-    return torch.from_numpy(reconstructed.astype(np.float32))
+    return torch.from_numpy(reconstructed.astype(np.float32)).bfloat16()
 
 # -----------------------------
 # MODIFIED INT8 QUANTIZATION
@@ -821,7 +821,7 @@ def main():
 
     if distributed: dist.barrier()
     with open("final_model.codebook.ptz", "rb") as f: blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(zlib.decompress(blob_disk)), map_location="cpu", weights_only=False)
     base_model.load_state_dict(dequantize_state_dict_codebook(quant_state), strict=True)
     torch.cuda.synchronize(); t_q = time.perf_counter()
     q_loss, q_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
